@@ -13,6 +13,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Static
+from textual.worker import get_current_worker
 
 from req_cli.core import discovery
 from req_cli.core.client import Result, set_profile_override
@@ -39,6 +40,7 @@ class RunScreen(Screen[None]):
 
     BINDINGS: typing.ClassVar = [
         Binding("enter", "send", "Send"),
+        Binding("escape", "cancel_send", "Cancel send", show=False),
         Binding("e", "edit_request", "Edit"),
         Binding("/", "open_search", "Search"),
         Binding("r", "refresh", "Refresh"),
@@ -240,7 +242,8 @@ class RunScreen(Screen[None]):
         ref = node.data if node is not None else None
         if not isinstance(ref, _FunctionRef):
             return
-        self._set_status(f"sending {ref.module.name}.{ref.function.name} ...")
+        self.query_one("#response", VimLog).loading = True
+        self._set_status(f"sending {ref.module.name}.{ref.function.name} ... (esc to cancel)")
         self.run_worker(
             lambda: self._send(ref),
             thread=True,
@@ -248,13 +251,30 @@ class RunScreen(Screen[None]):
             group="send",
         )
 
+    def action_cancel_send(self) -> None:
+        """
+        Abandon the in-flight request (``escape``).
+
+        The worker thread cannot interrupt a blocked socket read, so the
+        request keeps running in the background; its response is discarded
+        when it eventually lands.
+        """
+        if not self.app.workers.cancel_group(self, "send"):
+            return
+        self.query_one("#response", VimLog).loading = False
+        self._set_status("send cancelled - response discarded")
+
     def _send(self, ref: _FunctionRef) -> None:
         log = self.query_one("#response", VimLog)
+        worker = get_current_worker()
         try:
             func = discovery.load_function(ref.module.path, ref.function.name)
             result = func()
         except Exception as exc:  # noqa: BLE001 - report any failure in the UI, never crash
-            self.app.call_from_thread(self._show_error, ref, str(exc))
+            if not worker.is_cancelled:
+                self.app.call_from_thread(self._show_error, ref, str(exc))
+            return
+        if worker.is_cancelled:
             return
         if not isinstance(result, Result):
             self.app.call_from_thread(
@@ -266,6 +286,7 @@ class RunScreen(Screen[None]):
         self.app.call_from_thread(self._show_result, ref, result, log)
 
     def _show_result(self, ref: _FunctionRef, result: Result, log: VimLog) -> None:
+        log.loading = False
         log.clear()
         log.write(render_result(result))
         status = "ok" if result.ok else "failed"
@@ -273,6 +294,7 @@ class RunScreen(Screen[None]):
 
     def _show_error(self, ref: _FunctionRef, message: str) -> None:
         log = self.query_one("#response", VimLog)
+        log.loading = False
         log.clear()
         log.write(f"error running {ref.module.name}.{ref.function.name}:\n{message}")
         self._set_status("error")

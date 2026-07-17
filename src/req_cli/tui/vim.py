@@ -19,8 +19,11 @@ from __future__ import annotations
 import time
 import typing
 
+from rich.cells import cell_len
+from rich.segment import Segment
 from textual.binding import Binding
 from textual.message import Message
+from textual.strip import Strip
 from textual.widgets import Input, RichLog, SelectionList, Tree
 
 if typing.TYPE_CHECKING:
@@ -189,6 +192,18 @@ class VimLog(_GgMixin, _SearchMixin, RichLog):
 
     can_focus = True
 
+    COMPONENT_CLASSES: typing.ClassVar[set[str]] = {"vimlog--search-match"}
+
+    DEFAULT_CSS = """
+    VimLog .vimlog--search-match {
+        background: yellow 40%;
+        text-style: bold;
+    }
+    """
+
+    _search_needle: str = ""
+    """Lowercased active search pattern; empty when no highlight should show."""
+
     BINDINGS: typing.ClassVar = [
         Binding("j", "scroll_down", "Down", show=False),
         Binding("k", "scroll_up", "Up", show=False),
@@ -209,6 +224,43 @@ class VimLog(_GgMixin, _SearchMixin, RichLog):
         """Scroll half a page (``ctrl+d``/``ctrl+u``)."""
         step = max(1, self.scrollable_content_region.height // 2) * direction
         self.scroll_relative(y=step, animate=False)
+
+    def vim_search(self, pattern: str) -> int:
+        """Search and repaint so occurrences pick up the match highlight."""
+        self._search_needle = pattern.lower()
+        count = super().vim_search(pattern)
+        self.refresh()
+        return count
+
+    def render_line(self, y: int) -> Strip:
+        """Overlay the search-match style on needle occurrences in the visible line."""
+        strip = super().render_line(y)
+        needle = self._search_needle
+        text = strip.text
+        lower = text.lower()
+        if not needle or needle not in lower:
+            return strip
+        style = self.get_component_rich_style("vimlog--search-match")
+        spans: list[tuple[int, int]] = []
+        start = lower.find(needle)
+        while start != -1:
+            end = start + len(needle)
+            spans.append((cell_len(text[:start]), cell_len(text[:end])))
+            start = lower.find(needle, end)
+        pieces: list[Strip] = []
+        position = 0
+        for start_cell, end_cell in spans:
+            if start_cell > position:
+                pieces.append(strip.crop(position, start_cell))
+            match = strip.crop(start_cell, end_cell)
+            segments = [
+                Segment(segment.text, style if segment.style is None else segment.style + style) for segment in match
+            ]
+            pieces.append(Strip(segments, match.cell_length))
+            position = end_cell
+        if position < strip.cell_length:
+            pieces.append(strip.crop(position, strip.cell_length))
+        return Strip.join(pieces)
 
     def _find_matches(self, needle: str) -> list[typing.Any]:
         return [index for index, strip in enumerate(self.lines) if needle in strip.text.lower()]

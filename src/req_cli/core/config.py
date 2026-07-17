@@ -53,7 +53,7 @@ base_url = "http://127.0.0.1:8000"
 
 # [profiles.live]
 # base_url = "https://api.example.test"
-# timeout = 30.0
+# timeout = 30.0  # seconds; omit to wait indefinitely (useful when debugging a server)
 #
 # [profiles.live.headers]
 # X-Example-Token = "<token>"
@@ -76,7 +76,8 @@ class Profile:
     base_url: str
     headers: dict[str, str] = field(default_factory=dict)
     proxies: dict[str, str] = field(default_factory=dict)
-    timeout: float = 30.0
+    timeout: float | None = None
+    """Seconds before a request times out; ``None`` (the default) waits forever."""
 
 
 @dataclass(frozen=True)
@@ -131,11 +132,11 @@ def _parse_profiles(raw: dict[str, object]) -> dict[str, Profile]:
             raise ConfigError(msg)
         headers = body.get("headers", {})
         proxies = body.get("proxies", {})
-        timeout = body.get("timeout", 30.0)
+        timeout = body.get("timeout")
         if not isinstance(headers, dict) or not isinstance(proxies, dict):
             msg = f"profile {name!r}: 'headers' and 'proxies' must be tables"
             raise ConfigError(msg)
-        if not isinstance(timeout, int | float):
+        if timeout is not None and not isinstance(timeout, int | float):
             msg = f"profile {name!r}: 'timeout' must be a number"
             raise ConfigError(msg)
         profiles[name] = Profile(
@@ -143,7 +144,7 @@ def _parse_profiles(raw: dict[str, object]) -> dict[str, Profile]:
             base_url=base_url.rstrip("/"),
             headers={str(k): str(v) for k, v in headers.items()},
             proxies={str(k): str(v) for k, v in proxies.items()},
-            timeout=float(timeout),
+            timeout=float(timeout) if timeout is not None else None,
         )
     return profiles
 
@@ -196,7 +197,7 @@ def save_profile(
         entry["headers"] = profile.headers
     if profile.proxies:
         entry["proxies"] = profile.proxies
-    if profile.timeout != 30.0:  # noqa: PLR2004 - the documented default
+    if profile.timeout is not None:
         entry["timeout"] = profile.timeout
     profiles[profile.name] = entry
     if make_default or "default_profile" not in raw:

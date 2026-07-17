@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,56 @@ async def test_send_from_tree(
         await pilot.pause(delay=0.2)
         status = str(screen.query_one("#status").render())
         assert "ok" in status
+
+
+async def test_send_shows_throbber_and_escape_cancels(
+    project_with_requests: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"ok": true}'
+        url = "http://127.0.0.1:8000/x"
+        headers: dict[str, str] = {}  # noqa: RUF012
+
+        def json(self) -> Any:
+            return {"ok": True}
+
+    def slow_request(**_kwargs: Any) -> FakeResponse:
+        release.wait(timeout=5)
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "request", slow_request)
+    app = ReqApp()
+    try:
+        async with app.run_test() as pilot:
+            screen = app.screen
+            assert isinstance(screen, RunScreen)
+            tree = screen.query_one("#request-tree")
+            items = next(node for node in tree.root.children[0].children if "items" in str(node.label))
+            tree.move_cursor(items.children[0])
+            tree.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            log = screen.query_one("#response")
+            assert log.loading
+            assert "esc to cancel" in str(screen.query_one("#status").render())
+            # escape cancels: throbber goes away, UI is usable again
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not log.loading
+            assert "cancelled" in str(screen.query_one("#status").render())
+            # the abandoned worker's late response must not clobber the UI
+            release.set()
+            await pilot.pause(delay=0.2)
+            assert "cancelled" in str(screen.query_one("#status").render())
+            # escape with nothing in flight is a no-op
+            await pilot.press("escape")
+            assert "cancelled" in str(screen.query_one("#status").render())
+    finally:
+        release.set()
 
 
 async def test_profile_cycle_and_gen_screen(
@@ -286,6 +337,34 @@ async def test_slash_search_in_response_log(
         assert log.has_focus
         assert "1 match(es)" in str(screen.query_one("#status").render())
         assert log.scroll_offset.y > 0
+
+
+async def test_search_highlights_matches_in_response_log(
+    project_with_requests: dict[str, Path],
+) -> None:
+    app = ReqApp()
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, RunScreen)
+        log = screen.query_one("#response")
+        for index in range(50):
+            log.write(f"line {index} {'NEEDLE' if index == 40 else ''}")
+        log.focus()
+        await pilot.press("/")
+        await pilot.press(*"needle")
+        await pilot.press("enter")
+        await pilot.pause()
+        match_style = log.get_component_rich_style("vimlog--search-match")
+        strip = log.render_line(40 - log.scroll_offset.y)
+        assert "NEEDLE" in strip.text
+        highlighted = [seg for seg in strip if seg.style and seg.style.bgcolor == match_style.bgcolor]
+        assert "".join(seg.text for seg in highlighted) == "NEEDLE"
+        # an empty search clears the highlight
+        await pilot.press("/")
+        await pilot.press("enter")
+        await pilot.pause()
+        strip = log.render_line(40 - log.scroll_offset.y)
+        assert not [seg for seg in strip if seg.style and seg.style.bgcolor == match_style.bgcolor]
 
 
 async def test_n_still_generates_without_search(

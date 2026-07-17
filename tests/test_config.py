@@ -79,6 +79,20 @@ def test_missing_base_url(isolated_dirs: dict[str, Path]) -> None:
         load_config()
 
 
+def test_timeout_defaults_to_none(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text('[profiles.local]\nbase_url = "http://x"\n')
+    assert load_config().profile("local").timeout is None
+
+
+def test_explicit_timeout_is_kept(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text('[profiles.local]\nbase_url = "http://x"\ntimeout = 5\n')
+    assert load_config().profile("local").timeout == 5.0
+
+
 def test_store_dirs_respect_xdg(isolated_dirs: dict[str, Path]) -> None:
     assert global_store_dir() == isolated_dirs["data"] / "req-cli" / "requests"
     assert global_config_dir() == isolated_dirs["config"] / "req-cli"

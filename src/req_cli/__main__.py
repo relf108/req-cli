@@ -198,7 +198,12 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SCHEME=URL",
         help="proxy mapping (repeatable), e.g. https=http://proxy.example.test:8080",
     )
-    add_parser.add_argument("--timeout", type=float, default=30.0)
+    add_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="request timeout in seconds (default: wait indefinitely)",
+    )
     add_parser.add_argument("--dest", choices=("local", "global"), default="local")
     add_parser.add_argument("--default", action="store_true", help="make this the default profile")
     add_parser.set_defaults(func=_cmd_profile_add)

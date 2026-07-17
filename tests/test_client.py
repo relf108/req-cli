@@ -83,7 +83,7 @@ def test_send_success(monkeypatch: pytest.MonkeyPatch, config: Config) -> None:
     assert captured["url"] == "http://127.0.0.1:8000/v1/items"
     assert captured["headers"] == {"x-extra": "1"}
     assert captured["proxies"] is None
-    assert captured["timeout"] == 30.0
+    assert captured["timeout"] is None  # no timeout by default: requests wait indefinitely
 
 
 def test_send_profile_headers_and_proxies(monkeypatch: pytest.MonkeyPatch, config: Config) -> None:

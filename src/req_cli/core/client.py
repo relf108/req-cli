@@ -98,6 +98,8 @@ def send(  # noqa: PLR0913 - request builders are wide by nature, all kwargs opt
     Profile resolution: *config* if given, otherwise loaded from
     *project_root* / cwd. Extra *headers* are merged over profile headers.
     Transport errors are captured in ``Result.error`` rather than raised.
+    Requests wait indefinitely unless *timeout* or the profile's ``timeout``
+    sets a limit.
     """
     cfg = config or load_config(project_root)
     prof = cfg.profile(_profile_override or profile)
