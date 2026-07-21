@@ -29,13 +29,18 @@ Example::
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 
 REQUESTS_DIR_NAME = "requests"
 CONFIG_FILE_NAME = "config.toml"
+CONFIG_FUNCTIONS_FILE_NAME = "config_functions.py"
+_FUNCTION_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 CONFIG_TEMPLATE = """\
 # req-cli configuration
@@ -50,6 +55,7 @@ base_url = "http://127.0.0.1:8000"
 
 # [profiles.local.headers]
 # X-Example-Header = "value"
+# Authorization = "Bearer {get_token}"  # calls get_token() from requests/config_functions.py
 
 # [profiles.live]
 # base_url = "https://api.example.test"
@@ -116,8 +122,53 @@ def project_requests_dir(project_root: Path | None = None) -> Path:
     return root / REQUESTS_DIR_NAME
 
 
-def _parse_profiles(raw: dict[str, object]) -> dict[str, Profile]:
+def _load_config_functions(path: Path) -> ModuleType:
+    """Load trusted Python helpers used by the adjacent TOML config."""
+    if not path.is_file():
+        msg = f"{path}: required for config function calls"
+        raise ConfigError(msg)
+    spec = importlib.util.spec_from_file_location("_req_cli_user_config_functions", path)
+    if spec is None or spec.loader is None:
+        msg = f"{path}: could not load config functions"
+        raise ConfigError(msg)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        msg = f"{path}: failed to load config functions: {exc}"
+        raise ConfigError(msg) from exc
+    return module
+
+
+def _interpolate_header(value: str, module: ModuleType, path: Path, profile: str, header: str) -> str:
+    """Replace function placeholders in one header value."""
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        function = getattr(module, name, None)
+        if not callable(function):
+            msg = f"{path}: profile {profile!r} header {header!r}: {name!r} is not a callable config function"
+            raise ConfigError(msg)
+        try:
+            result = function()
+        except Exception as exc:
+            msg = f"{path}: profile {profile!r} header {header!r}: config function {name!r} failed: {exc}"
+            raise ConfigError(msg) from exc
+        if not isinstance(result, str):
+            msg = (
+                f"{path}: profile {profile!r} header {header!r}: "
+                f"config function {name!r} returned {type(result).__name__}, not str"
+            )
+            raise ConfigError(msg)
+        return result
+
+    return _FUNCTION_PATTERN.sub(replace, value)
+
+
+def _parse_profiles(raw: dict[str, object], config_path: Path) -> dict[str, Profile]:
     profiles: dict[str, Profile] = {}
+    config_functions: ModuleType | None = None
+    config_functions_path = config_path.with_name(CONFIG_FUNCTIONS_FILE_NAME)
     raw_profiles = raw.get("profiles", {})
     if not isinstance(raw_profiles, dict):
         msg = "'profiles' must be a table"
@@ -139,10 +190,18 @@ def _parse_profiles(raw: dict[str, object]) -> dict[str, Profile]:
         if timeout is not None and not isinstance(timeout, int | float):
             msg = f"profile {name!r}: 'timeout' must be a number"
             raise ConfigError(msg)
+        parsed_headers = {str(k): str(v) for k, v in headers.items()}
+        if any(_FUNCTION_PATTERN.search(value) for value in parsed_headers.values()):
+            if config_functions is None:
+                config_functions = _load_config_functions(config_functions_path)
+            parsed_headers = {
+                key: _interpolate_header(value, config_functions, config_functions_path, str(name), key)
+                for key, value in parsed_headers.items()
+            }
         profiles[name] = Profile(
             name=name,
             base_url=base_url.rstrip("/"),
-            headers={str(k): str(v) for k, v in headers.items()},
+            headers=parsed_headers,
             proxies={str(k): str(v) for k, v in proxies.items()},
             timeout=float(timeout) if timeout is not None else None,
         )
@@ -218,8 +277,8 @@ def load_config(project_root: Path | None = None) -> Config:
     global_raw = _load_toml(global_config_dir() / CONFIG_FILE_NAME)
     project_raw = _load_toml(project_requests_dir(project_root) / CONFIG_FILE_NAME)
 
-    profiles = _parse_profiles(global_raw)
-    profiles.update(_parse_profiles(project_raw))
+    profiles = _parse_profiles(global_raw, global_config_dir() / CONFIG_FILE_NAME)
+    profiles.update(_parse_profiles(project_raw, project_requests_dir(project_root) / CONFIG_FILE_NAME))
     if not profiles:
         profiles["local"] = Profile(name="local", base_url="http://127.0.0.1:8000")
 

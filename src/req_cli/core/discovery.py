@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from req_cli.core.client import Result
-from req_cli.core.config import global_store_dir, project_requests_dir
+from req_cli.core.config import CONFIG_FUNCTIONS_FILE_NAME, global_store_dir, project_requests_dir
 
 Scope = Literal["local", "global"]
 
@@ -72,7 +72,7 @@ def _scan_dir(directory: Path, scope: Scope) -> list[RequestModule]:
     modules = []
     for path in paths:
         relative = path.relative_to(directory)
-        if any(part.startswith(("_", ".")) for part in relative.parts):
+        if path.name == CONFIG_FUNCTIONS_FILE_NAME or any(part.startswith(("_", ".")) for part in relative.parts):
             continue
         try:
             source = path.read_text()

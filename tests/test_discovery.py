@@ -38,6 +38,7 @@ def test_discover_local_and_global(isolated_dirs: dict[str, Path]) -> None:
     local = isolated_dirs["project"] / "requests"
     local.mkdir()
     (local / "items.py").write_text(MODULE)
+    (local / "config_functions.py").write_text("def get_token():\n    return 'token'\n")
     (local / "_private.py").write_text("def x():\n    pass\n")
     store = global_store_dir()
     store.mkdir(parents=True)

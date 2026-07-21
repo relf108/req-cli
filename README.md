@@ -1,72 +1,129 @@
 # req-cli
 
-Generate and send saved API requests via a lazygit-style TUI.
+Generate, save, and send API requests through a lazygit-style terminal UI or a
+headless CLI.
 
-`req` replaces the hand-rolled `requests/` folders scattered across API repos.
-It has two roles:
+`req` turns an OpenAPI document into editable Python request modules. It then
+discovers those modules from a project-local `requests/` directory or a global
+request store and runs them with reusable URL, header, proxy, timeout, and
+response handling.
 
-1. **Generate** — parse an OpenAPI spec and generate plain Python request
-   modules (one function per endpoint) that hook into shared handlers for URL
-   building, headers, proxies, and response rendering. Premade files are
-   validated (syntax + contract) before being written into a project.
-2. **Run** — browse saved request modules (project-local `requests/` folder or
-   the global store) and send them, viewing timing and pretty-printed
-   responses.
+## Features
+
+- Generate plain Python request functions from OpenAPI 3.0 and 3.1 documents.
+- Browse and send saved requests from a keyboard-driven TUI.
+- Run and list requests from scripts or a shell.
+- Share profiles globally while overriding them per project.
+- Resolve dynamic header values through trusted Python helper functions.
+- Validate hand-written request modules before using them.
 
 ## Install
 
+The project requires Python 3.13 or later.
+
 ```sh
-nix profile install .        # via flake
-# or for development:
+nix profile install .
+```
+
+For development:
+
+```sh
 uv sync
 uv run req
 ```
 
-## Usage
+## Quick Start
+
+Run these commands from the project that will own the saved requests:
 
 ```sh
-req                  # open the TUI in the current project
-req run items.get_item      # headless: send one saved request
-req run demo_app/items.get_item  # global-store request, qualified by app
-req gen openapi.yaml         # headless: generate request modules from a spec
-req gen openapi.yaml --dest global --app-name demo_app   # into the global store
-req validate my_requests.py  # validate a premade file
-req profile add live --base-url https://api.example.test \
-    --header "X-Example-Header:value" --proxy https=http://proxy.example.test:8080
-req profile list
+req profile add local \
+    --base-url http://127.0.0.1:8000 \
+    --default
+
+req gen ./openapi.yaml
+req list
+req run items.get_item
+req
 ```
 
-## Keys
+Generation writes editable modules to `./requests/`. Review generated defaults,
+parameters, and request bodies before sending them.
 
-Vim motions are first-class everywhere: `j`/`k` move, `h`/`l`
-collapse/expand (and `l` on a request sends it), `gg`/`G` jump top/bottom,
-`ctrl+d`/`ctrl+u` half-page, `/` to search the focused pane with `n`/`N`
-cycling matches (escape cancels). Arrow keys also work.
+## Commands
 
-In a focused response or preview pane, `y` copies the complete contents. Press
-`v` for linewise visual mode, extend the highlighted selection with `j`/`k`,
-`gg`, or `G`, then press `y` to copy it; `escape` cancels the selection.
+| Command | Purpose |
+|---|---|
+| `req` | Open the TUI. |
+| `req list` | List discovered request modules and functions. |
+| `req run <module>.<function>` | Send one saved request. |
+| `req gen <openapi.yaml>` | Generate request modules from an OpenAPI document. |
+| `req validate <file.py>` | Validate an existing request module. |
+| `req profile add <name> --base-url <url>` | Add or replace a profile. |
+| `req profile list` | List the effective profiles. |
 
-| Key | Run view | Generate view |
-|-----|----------|---------------|
-| `enter` | send selected request | load spec / toggle |
-| `e` | edit request in `$EDITOR` (jumps to the function) | |
-| `r` | refresh request list | |
-| `p` | cycle profile (needs >1 profile configured) | |
-| `n` | open generate view | |
-| `c` / `C` | edit local / global config in `$EDITOR` | |
-| `w` / `W` | | write selected modules local / global |
-| `1` / `2` | focus requests / response pane | focus modules / preview pane |
-| `y` / `v` | copy response / visually select lines | copy preview / visually select lines |
-| `escape` | | back to run view |
-| `q` | quit | |
+Useful examples:
 
-## Layout
+```sh
+req run items.get_item --profile staging --verbose
+req gen ./openapi.yaml --dry-run
+req gen ./openapi.yaml --dest global --app-name demo_app
+req run demo_app/items.get_item
+req profile add staging \
+    --base-url https://api.example.test \
+    --header 'X-Client-Name:req-cli' \
+    --proxy 'https=http://proxy.example.test:8080' \
+    --timeout 30
+```
 
-- Project-local requests live in `./requests/` of whatever repo you run `req` from.
-- Global requests live in `~/.local/share/req-cli/requests/<app>/`, one folder
-  per app named from the spec's `info.title` (editable at generation time).
-- Config (base URLs, header profiles, proxies) is read from
-  `./requests/config.toml` merged over `~/.config/req-cli/config.toml`.
-  Edit it with `c`/`C` in the TUI (opens `$EDITOR`, seeded with a commented
-  template) or `req profile add`.
+## Configuration
+
+Project configuration is read from `./requests/config.toml` and overrides
+global configuration from `~/.config/req-cli/config.toml`. Header profiles can
+use a zero-argument function from the adjacent `config_functions.py`:
+
+```toml
+[profiles.staging]
+base_url = "https://api.example.test"
+
+[profiles.staging.headers]
+Authorization = "Bearer {get_access_token}"
+```
+
+```python
+# ./requests/config_functions.py
+import os
+
+
+def get_access_token() -> str:
+    return os.environ["API_TOKEN"]
+```
+
+`config_functions.py` is executable trusted code and is hidden from request
+module discovery.
+
+## Storage
+
+| Content | Default location |
+|---|---|
+| Project requests | `./requests/*.py` |
+| Project configuration | `./requests/config.toml` |
+| Project config functions | `./requests/config_functions.py` |
+| Global requests | `~/.local/share/req-cli/requests/<app>/*.py` |
+| Global configuration | `~/.config/req-cli/config.toml` |
+| Global config functions | `~/.config/req-cli/config_functions.py` |
+
+The global locations respect `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.
+
+## TUI
+
+Vim motions work throughout the UI. Use `j`/`k` to move, `h`/`l` to
+collapse or expand, `gg`/`G` to jump, `/` to search, and `n`/`N` to cycle
+matches. In the run view, `enter` sends a request, `p` changes profile, `e`
+opens the selected request in `$EDITOR`, and `n` opens generation.
+
+## Documentation
+
+See [Using the req Framework](docs/framework.md) for request authoring,
+profiles, dynamic headers, OpenAPI generation, validation, TUI workflows, and
+current limitations.

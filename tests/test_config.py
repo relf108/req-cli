@@ -57,6 +57,84 @@ def test_project_overrides_global(isolated_dirs: dict[str, Path]) -> None:
     assert config.default_profile == "live"
 
 
+def test_project_header_calls_config_function(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        """
+        [profiles.live]
+        base_url = "https://example.test"
+
+        [profiles.live.headers]
+        Authorization = "Bearer {get_token}"
+        X-Combined = "{prefix}-{get_token}"
+        """,
+    )
+    (requests_dir / "config_functions.py").write_text(
+        """
+def get_token():
+    return "secret"
+
+def prefix():
+    return "dynamic"
+""",
+    )
+
+    headers = load_config().profile("live").headers
+
+    assert headers == {"Authorization": "Bearer secret", "X-Combined": "dynamic-secret"}
+
+
+def test_global_header_uses_global_config_function(isolated_dirs: dict[str, Path]) -> None:
+    global_dir = global_config_dir()
+    global_dir.mkdir(parents=True)
+    (global_dir / "config.toml").write_text(
+        """
+        [profiles.live]
+        base_url = "https://example.test"
+
+        [profiles.live.headers]
+        Authorization = "Bearer {get_token}"
+        """,
+    )
+    (global_dir / "config_functions.py").write_text('def get_token():\n    return "global-token"\n')
+
+    assert load_config().profile("live").headers["Authorization"] == "Bearer global-token"
+
+
+def test_header_function_requires_adjacent_config_functions(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+
+    with pytest.raises(ConfigError, match=r"requests/config_functions\.py: required"):
+        load_config()
+
+
+@pytest.mark.parametrize(
+    ("function", "error"),
+    [
+        ("get_token = 'not callable'", "not a callable config function"),
+        ("def get_token():\n    return 42", "returned int, not str"),
+        ("def get_token():\n    raise RuntimeError('expired')", "config function 'get_token' failed: expired"),
+    ],
+)
+def test_invalid_header_function(isolated_dirs: dict[str, Path], function: str, error: str) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text(function)
+
+    with pytest.raises(ConfigError, match=error):
+        load_config()
+
+
 def test_unknown_profile_raises(isolated_dirs: dict[str, Path]) -> None:
     config = load_config()
     with pytest.raises(ConfigError, match="unknown profile"):
