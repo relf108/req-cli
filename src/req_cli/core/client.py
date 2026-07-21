@@ -91,6 +91,7 @@ def send(  # noqa: PLR0913 - request builders are wide by nature, all kwargs opt
     config: Config | None = None,
     project_root: Path | None = None,
     timeout: float | None = None,
+    verify: bool = True,
 ) -> Result:
     """
     Send a request using the named profile and return a :class:`Result`.
@@ -99,7 +100,8 @@ def send(  # noqa: PLR0913 - request builders are wide by nature, all kwargs opt
     *project_root* / cwd. Extra *headers* are merged over profile headers.
     Transport errors are captured in ``Result.error`` rather than raised.
     Requests wait indefinitely unless *timeout* or the profile's ``timeout``
-    sets a limit.
+    sets a limit. TLS certificate verification can be disabled with
+    ``verify=False``.
     """
     cfg = config or load_config(project_root)
     prof = cfg.profile(_profile_override or profile)
@@ -116,6 +118,7 @@ def send(  # noqa: PLR0913 - request builders are wide by nature, all kwargs opt
             headers=merged_headers,
             proxies=prof.proxies or None,
             timeout=timeout if timeout is not None else prof.timeout,
+            verify=verify,
         )
     except requests.RequestException as exc:
         return Result(

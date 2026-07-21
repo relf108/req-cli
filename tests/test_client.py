@@ -75,6 +75,7 @@ def test_send_success(monkeypatch: pytest.MonkeyPatch, config: Config) -> None:
         params={"page": 1},
         headers={"x-extra": "1"},
         config=config,
+        verify=False,
     )
     assert result.status == 200
     assert result.ok
@@ -84,6 +85,7 @@ def test_send_success(monkeypatch: pytest.MonkeyPatch, config: Config) -> None:
     assert captured["headers"] == {"x-extra": "1"}
     assert captured["proxies"] is None
     assert captured["timeout"] is None  # no timeout by default: requests wait indefinitely
+    assert captured["verify"] is False
 
 
 def test_send_profile_headers_and_proxies(monkeypatch: pytest.MonkeyPatch, config: Config) -> None:
