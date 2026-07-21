@@ -27,6 +27,7 @@ from textual.strip import Strip
 from textual.widgets import Input, RichLog, SelectionList, Tree
 
 if typing.TYPE_CHECKING:
+    from rich.console import RenderableType
     from textual.widgets.tree import TreeNode
 
 GG_INTERVAL = 0.6
@@ -99,8 +100,9 @@ class _SearchMixin:
         self._search_index = (self._search_index + delta) % len(self._search_matches)
         self._go_to_match(self._search_matches[self._search_index])
 
-    def check_action(self, action: str, _parameters: tuple[object, ...]) -> bool | None:
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Disable ``n``/``N`` until a search is active so screens can use them."""
+        del parameters
         if action in ("vim_search_next", "vim_search_prev"):
             return bool(self._search_matches)
         return True
@@ -188,16 +190,22 @@ class VimTree(_GgMixin, _SearchMixin, Tree[object]):
 
 
 class VimLog(_GgMixin, _SearchMixin, RichLog):
-    """RichLog with vim motions; focusable so panes can be scrolled directly."""
+    """RichLog with vim motions, search, and linewise visual yanking."""
 
     can_focus = True
 
-    COMPONENT_CLASSES: typing.ClassVar[set[str]] = {"vimlog--search-match"}
+    COMPONENT_CLASSES: typing.ClassVar[set[str]] = {
+        "vimlog--search-match",
+        "vimlog--visual-selection",
+    }
 
     DEFAULT_CSS = """
     VimLog .vimlog--search-match {
         background: yellow 40%;
         text-style: bold;
+    }
+    VimLog .vimlog--visual-selection {
+        background: $accent 40%;
     }
     """
 
@@ -205,25 +213,139 @@ class VimLog(_GgMixin, _SearchMixin, RichLog):
     """Lowercased active search pattern; empty when no highlight should show."""
 
     BINDINGS: typing.ClassVar = [
-        Binding("j", "scroll_down", "Down", show=False),
-        Binding("k", "scroll_up", "Up", show=False),
+        Binding("j", "vim_down", "Down", show=False),
+        Binding("k", "vim_up", "Up", show=False),
         Binding("h", "scroll_left", "Left", show=False),
         Binding("l", "scroll_right", "Right", show=False),
         Binding("g", "vim_g", "Top (gg)", show=False),
-        Binding("G", "scroll_end", "Bottom", show=False),
+        Binding("G", "vim_bottom", "Bottom", show=False),
         Binding("ctrl+d", "vim_half_page(1)", "Half page down", show=False),
         Binding("ctrl+u", "vim_half_page(-1)", "Half page up", show=False),
+        Binding("v", "vim_visual", "Visual select", show=False),
+        Binding("y", "vim_yank", "Yank", show=False),
+        Binding("escape", "vim_cancel_visual", "Cancel selection", show=False),
         *_SEARCH_BINDINGS,
     ]
 
+    def __init__(self, *args: typing.Any, **kwargs: typing.Any) -> None:
+        """Initialize visual selection and unwrapped yank state."""
+        super().__init__(*args, **kwargs)
+        self._visual_anchor: int | None = None
+        self._visual_cursor: int | None = None
+        self._written_text: list[str] = []
+
+    @typing.override
+    def write(
+        self,
+        content: RenderableType | object,
+        width: int | None = None,
+        expand: bool = False,
+        shrink: bool = True,
+        scroll_end: bool | None = None,
+        animate: bool = False,
+    ) -> typing.Self:
+        """Write content and retain its unwrapped text for whole-log yanks."""
+        if self._size_known:
+            self._written_text.append(str(content))
+        return super().write(content, width, expand, shrink, scroll_end, animate)
+
+    def clear(self) -> typing.Self:
+        """Clear content and any active visual selection."""
+        self._written_text.clear()
+        self._cancel_visual()
+        return super().clear()
+
     def vim_go_top(self) -> None:
-        """Scroll to the top (``gg``)."""
-        self.scroll_home(animate=False)
+        """Scroll to the top, extending an active visual selection."""
+        if self._visual_cursor is None:
+            self.scroll_home(animate=False)
+        else:
+            self._move_visual_cursor(0)
+
+    def action_vim_bottom(self) -> None:
+        """Scroll to the bottom, extending an active visual selection."""
+        if self._visual_cursor is None:
+            self.scroll_end(animate=False)
+        elif self.lines:
+            self._move_visual_cursor(len(self.lines) - 1)
+
+    def action_vim_down(self) -> None:
+        """Scroll down, or extend a visual selection down one line."""
+        if self._visual_cursor is None:
+            self.scroll_down(animate=False)
+        else:
+            self._move_visual_cursor(self._visual_cursor + 1)
+
+    def action_vim_up(self) -> None:
+        """Scroll up, or extend a visual selection up one line."""
+        if self._visual_cursor is None:
+            self.scroll_up(animate=False)
+        else:
+            self._move_visual_cursor(self._visual_cursor - 1)
 
     def action_vim_half_page(self, direction: int) -> None:
         """Scroll half a page (``ctrl+d``/``ctrl+u``)."""
         step = max(1, self.scrollable_content_region.height // 2) * direction
         self.scroll_relative(y=step, animate=False)
+
+    def action_vim_visual(self) -> None:
+        """Enter or leave linewise visual mode at the first visible line."""
+        if self._visual_anchor is not None:
+            self._cancel_visual()
+            return
+        if not self.lines:
+            return
+        line = min(int(self.scroll_offset.y), len(self.lines) - 1)
+        self._visual_anchor = self._visual_cursor = line
+        self.refresh()
+
+    def action_vim_cancel_visual(self) -> None:
+        """Leave visual mode without copying."""
+        self._cancel_visual()
+
+    def action_vim_yank(self) -> None:
+        """Copy the visual line range, or the entire log when none is selected."""
+        bounds = self._visual_bounds
+        if bounds is None:
+            text = "\n".join(self._written_text)
+        else:
+            start, end = bounds
+            text = "\n".join(self.lines[index].text.rstrip() for index in range(start, end + 1))
+        if not text:
+            return
+        self.app.copy_to_clipboard(text)
+        self.notify(f"Copied {text.count(chr(10)) + 1} line(s)", title="Yanked")
+        self._cancel_visual()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Let screen-level escape bindings run unless visual mode is active."""
+        if action == "vim_cancel_visual":
+            return self._visual_anchor is not None
+        return super().check_action(action, parameters)
+
+    @property
+    def _visual_bounds(self) -> tuple[int, int] | None:
+        if self._visual_anchor is None or self._visual_cursor is None:
+            return None
+        start, end = sorted((self._visual_anchor, self._visual_cursor))
+        return start, end
+
+    def _move_visual_cursor(self, line: int) -> None:
+        if not self.lines:
+            return
+        self._visual_cursor = max(0, min(line, len(self.lines) - 1))
+        top = int(self.scroll_offset.y)
+        height = max(1, self.scrollable_content_region.height)
+        if self._visual_cursor < top:
+            self.scroll_to(y=self._visual_cursor, animate=False)
+        elif self._visual_cursor >= top + height:
+            self.scroll_to(y=self._visual_cursor - height + 1, animate=False)
+        self.refresh()
+
+    def _cancel_visual(self) -> None:
+        self._visual_anchor = None
+        self._visual_cursor = None
+        self.refresh()
 
     def vim_search(self, pattern: str) -> int:
         """Search and repaint so occurrences pick up the match highlight."""
@@ -233,34 +355,44 @@ class VimLog(_GgMixin, _SearchMixin, RichLog):
         return count
 
     def render_line(self, y: int) -> Strip:
-        """Overlay the search-match style on needle occurrences in the visible line."""
+        """Overlay search and visual-selection styles on a visible line."""
         strip = super().render_line(y)
         needle = self._search_needle
         text = strip.text
         lower = text.lower()
-        if not needle or needle not in lower:
-            return strip
-        style = self.get_component_rich_style("vimlog--search-match")
-        spans: list[tuple[int, int]] = []
-        start = lower.find(needle)
-        while start != -1:
-            end = start + len(needle)
-            spans.append((cell_len(text[:start]), cell_len(text[:end])))
-            start = lower.find(needle, end)
-        pieces: list[Strip] = []
-        position = 0
-        for start_cell, end_cell in spans:
-            if start_cell > position:
-                pieces.append(strip.crop(position, start_cell))
-            match = strip.crop(start_cell, end_cell)
+        if needle and needle in lower:
+            style = self.get_component_rich_style("vimlog--search-match")
+            spans: list[tuple[int, int]] = []
+            start = lower.find(needle)
+            while start != -1:
+                end = start + len(needle)
+                spans.append((cell_len(text[:start]), cell_len(text[:end])))
+                start = lower.find(needle, end)
+            pieces: list[Strip] = []
+            position = 0
+            for start_cell, end_cell in spans:
+                if start_cell > position:
+                    pieces.append(strip.crop(position, start_cell))
+                match = strip.crop(start_cell, end_cell)
+                segments = [
+                    Segment(segment.text, style if segment.style is None else segment.style + style)
+                    for segment in match
+                ]
+                pieces.append(Strip(segments, match.cell_length))
+                position = end_cell
+            if position < strip.cell_length:
+                pieces.append(strip.crop(position, strip.cell_length))
+            strip = Strip.join(pieces)
+
+        bounds = self._visual_bounds
+        line = int(self.scroll_offset.y) + y
+        if bounds is not None and bounds[0] <= line <= bounds[1]:
+            style = self.get_component_rich_style("vimlog--visual-selection")
             segments = [
-                Segment(segment.text, style if segment.style is None else segment.style + style) for segment in match
+                Segment(segment.text, style if segment.style is None else segment.style + style) for segment in strip
             ]
-            pieces.append(Strip(segments, match.cell_length))
-            position = end_cell
-        if position < strip.cell_length:
-            pieces.append(strip.crop(position, strip.cell_length))
-        return Strip.join(pieces)
+            strip = Strip(segments, strip.cell_length)
+        return strip
 
     def _find_matches(self, needle: str) -> list[typing.Any]:
         return [index for index, strip in enumerate(self.lines) if needle in strip.text.lower()]

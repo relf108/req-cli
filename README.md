@@ -43,6 +43,10 @@ collapse/expand (and `l` on a request sends it), `gg`/`G` jump top/bottom,
 `ctrl+d`/`ctrl+u` half-page, `/` to search the focused pane with `n`/`N`
 cycling matches (escape cancels). Arrow keys also work.
 
+In a focused response or preview pane, `y` copies the complete contents. Press
+`v` for linewise visual mode, extend the highlighted selection with `j`/`k`,
+`gg`, or `G`, then press `y` to copy it; `escape` cancels the selection.
+
 | Key | Run view | Generate view |
 |-----|----------|---------------|
 | `enter` | send selected request | load spec / toggle |
@@ -53,6 +57,7 @@ cycling matches (escape cancels). Arrow keys also work.
 | `c` / `C` | edit local / global config in `$EDITOR` | |
 | `w` / `W` | | write selected modules local / global |
 | `1` / `2` | focus requests / response pane | focus modules / preview pane |
+| `y` / `v` | copy response / visually select lines | copy preview / visually select lines |
 | `escape` | | back to run view |
 | `q` | quit | |
 

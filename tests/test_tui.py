@@ -367,6 +367,39 @@ async def test_search_highlights_matches_in_response_log(
         assert not [seg for seg in strip if seg.style and seg.style.bgcolor == match_style.bgcolor]
 
 
+async def test_vim_yanks_response_and_visual_line_selection(
+    project_with_requests: dict[str, Path],
+) -> None:
+    app = ReqApp()
+    response = "first line\nsecond line\nthird line\nfourth line"
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, RunScreen)
+        log = screen.query_one("#response")
+        log.write(response)
+        log.focus()
+
+        await pilot.press("G", "g", "g")
+        await pilot.press("y")
+        assert app._clipboard == response  # noqa: SLF001
+
+        await pilot.press("v", "v", "v", "j", "j")
+        selection_style = log.get_component_rich_style("vimlog--visual-selection")
+        selected_line = log.render_line(0)
+        assert any(segment.style and segment.style.bgcolor == selection_style.bgcolor for segment in selected_line)
+        await pilot.press("y")
+        assert app._clipboard == "first line\nsecond line\nthird line"  # noqa: SLF001
+
+        await pilot.press("v", "G", "g", "g", "y")
+        assert app._clipboard == "first line"  # noqa: SLF001
+
+        await pilot.press("v", "G", "y")
+        assert app._clipboard == response  # noqa: SLF001
+
+        await pilot.press("v", "j", "escape", "y")
+        assert app._clipboard == response  # noqa: SLF001
+
+
 async def test_n_still_generates_without_search(
     project_with_requests: dict[str, Path],
 ) -> None:
