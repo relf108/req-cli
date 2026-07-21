@@ -86,6 +86,7 @@ def send(  # noqa: PLR0913 - request builders are wide by nature, all kwargs opt
     path_params: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
     json: Any = None,  # noqa: ANN401 - request bodies are arbitrary JSON
+    body: Any = None,  # noqa: ANN401 - raw request bodies accept all requests data types
     headers: dict[str, str] | None = None,
     profile: str | None = None,
     config: Config | None = None,
@@ -115,6 +116,7 @@ def send(  # noqa: PLR0913 - request builders are wide by nature, all kwargs opt
             url=url,
             params=params,
             json=json,
+            data=body,
             headers=merged_headers,
             proxies=prof.proxies or None,
             timeout=timeout if timeout is not None else prof.timeout,

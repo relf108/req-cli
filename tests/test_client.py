@@ -73,6 +73,7 @@ def test_send_success(monkeypatch: pytest.MonkeyPatch, config: Config) -> None:
         "get",
         "/v1/items",
         params={"page": 1},
+        body="raw body",
         headers={"x-extra": "1"},
         config=config,
         verify=False,
@@ -82,6 +83,7 @@ def test_send_success(monkeypatch: pytest.MonkeyPatch, config: Config) -> None:
     assert result.json_body == {"ok": True}
     assert captured["method"] == "GET"
     assert captured["url"] == "http://127.0.0.1:8000/v1/items"
+    assert captured["data"] == "raw body"
     assert captured["headers"] == {"x-extra": "1"}
     assert captured["proxies"] is None
     assert captured["timeout"] is None  # no timeout by default: requests wait indefinitely
