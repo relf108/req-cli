@@ -21,6 +21,18 @@ response handling.
 
 The project requires Python 3.13 or later.
 
+On Linux or macOS without Nix:
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/relf108/req-cli/main/install.sh | sh
+```
+
+The script installs `uv` if needed, then uses it to install `req-cli` and its
+Python runtime globally for the current user. It also updates the shell PATH so
+`req` is available in new shells.
+
+With Nix:
+
 ```sh
 nix profile install .
 ```
