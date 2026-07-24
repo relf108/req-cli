@@ -121,11 +121,11 @@ module discovery.
 | Project requests | `./requests/*.py` |
 | Project configuration | `./requests/config.toml` |
 | Project config functions | `./requests/config_functions.py` |
-| Global requests | `~/.local/share/req-cli/requests/<app>/*.py` |
+| Global requests | `~/.config/req-cli/requests/<app>/*.py` |
 | Global configuration | `~/.config/req-cli/config.toml` |
 | Global config functions | `~/.config/req-cli/config_functions.py` |
 
-The global locations respect `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.
+The global locations respect `XDG_CONFIG_HOME`.
 
 ## TUI
 

@@ -47,7 +47,7 @@ def test_gen_to_global_store_uses_app_folder(
     isolated_dirs: dict[str, Path],
 ) -> None:
     assert main(["gen", str(spec_path), "--dest", "global"]) == 0
-    store = isolated_dirs["data"] / "req-cli" / "requests"
+    store = isolated_dirs["config"] / "req-cli" / "requests"
     # spec title is "demo" -> app folder "demo"
     assert (store / "demo" / "items.py").exists()
     assert not (store / "items.py").exists()
@@ -55,7 +55,7 @@ def test_gen_to_global_store_uses_app_folder(
 
 def test_gen_global_app_name_override(spec_path: Path, isolated_dirs: dict[str, Path]) -> None:
     assert main(["gen", str(spec_path), "--dest", "global", "--app-name", "custom"]) == 0
-    store = isolated_dirs["data"] / "req-cli" / "requests"
+    store = isolated_dirs["config"] / "req-cli" / "requests"
     assert (store / "custom" / "items.py").exists()
 
 

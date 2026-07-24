@@ -72,7 +72,7 @@ Project configuration:
   <current-directory>/requests/config_functions.py
 
 Global requests:
-  ${XDG_DATA_HOME:-~/.local/share}/req-cli/requests/<app>/
+  ${XDG_CONFIG_HOME:-~/.config}/req-cli/requests/<app>/
 
 Global configuration:
   ${XDG_CONFIG_HOME:-~/.config}/req-cli/config.toml

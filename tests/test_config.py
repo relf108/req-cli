@@ -172,7 +172,7 @@ def test_explicit_timeout_is_kept(isolated_dirs: dict[str, Path]) -> None:
 
 
 def test_store_dirs_respect_xdg(isolated_dirs: dict[str, Path]) -> None:
-    assert global_store_dir() == isolated_dirs["data"] / "req-cli" / "requests"
+    assert global_store_dir() == isolated_dirs["config"] / "req-cli" / "requests"
     assert global_config_dir() == isolated_dirs["config"] / "req-cli"
 
 

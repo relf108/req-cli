@@ -480,7 +480,7 @@ async def test_gen_screen_write_global_app_folder(
         app_input.value = "renamed"
         await pilot.press("W")
         await pilot.pause()
-        store = isolated_dirs["data"] / "req-cli" / "requests"
+        store = isolated_dirs["config"] / "req-cli" / "requests"
         assert (store / "renamed" / "items.py").exists()
         status = str(gen.query_one("#gen-status").render())
         assert "global (renamed)" in status

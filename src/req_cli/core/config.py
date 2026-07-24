@@ -112,7 +112,7 @@ def global_config_dir() -> Path:
 
 def global_store_dir() -> Path:
     """Return the global saved-requests directory (XDG aware)."""
-    base = os.environ.get("XDG_DATA_HOME", "~/.local/share")
+    base = os.environ.get("XDG_CONFIG_HOME", "~/.config")
     return Path(base).expanduser() / "req-cli" / REQUESTS_DIR_NAME
 
 

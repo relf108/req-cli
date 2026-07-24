@@ -4,7 +4,7 @@ Discovery of saved request modules and their request functions.
 Two sources are scanned:
 
 - **local**: ``./requests/`` in the current project
-- **global**: ``~/.local/share/req-cli/requests/``
+- **global**: ``~/.config/req-cli/requests/``
 
 Listing uses ``ast`` so that browsing the TUI never executes module-level
 code; a module is only imported when a function is actually invoked.
