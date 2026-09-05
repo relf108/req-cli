@@ -23,6 +23,12 @@ HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch")
 MAX_EXAMPLE_DEPTH = 6
 """Recursion cutoff when building example bodies from nested schemas."""
 
+_NON_ALNUM_RE = re.compile(r"[^0-9a-zA-Z]+")
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
+_UNDERSCORE_RUN_RE = re.compile(r"_+")
+_VERSION_SEGMENT_RE = re.compile(r"v\d+")
+_PATH_PLACEHOLDER_RE = re.compile(r"[{}]")
+
 
 class SpecError(Exception):
     """Raised when a spec cannot be read, parsed, or validated."""
@@ -53,9 +59,9 @@ class Endpoint:
 
 
 def _snake(name: str) -> str:
-    name = re.sub(r"[^0-9a-zA-Z]+", "_", name)
-    name = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", name)
-    return re.sub(r"_+", "_", name).strip("_").lower()
+    name = _NON_ALNUM_RE.sub("_", name)
+    name = _CAMEL_BOUNDARY_RE.sub("_", name)
+    return _UNDERSCORE_RUN_RE.sub("_", name).strip("_").lower()
 
 
 class _Resolver:
@@ -63,16 +69,23 @@ class _Resolver:
 
     def __init__(self, spec: Any) -> None:
         self._spec = spec
+        self._resolved: dict[int, Any] = {}
 
     def resolve(self, node: Any) -> Any:
         """Follow ``Reference`` nodes until a concrete object (or None)."""
+        key = id(node)
+        if key in self._resolved:
+            return self._resolved[key]
         seen: set[str] = set()
-        while isinstance(ref := getattr(node, "ref", None), str):
+        current = node
+        while isinstance(ref := getattr(current, "ref", None), str):
             if not ref.startswith("#/components/") or ref in seen:
-                return None
+                current = None
+                break
             seen.add(ref)
-            node = self._lookup(ref)
-        return node
+            current = self._lookup(ref)
+        self._resolved[key] = current
+        return current
 
     def _lookup(self, ref: str) -> Any:
         _, _, section, name = ref.split("/", 3)
@@ -155,7 +168,7 @@ def _function_name(method: str, path: str, operation: Any) -> str:
     operation_id = operation.operationId
     if operation_id:
         return _snake(operation_id)
-    slug = _snake(re.sub(r"[{}]", "", path)) or "root"
+    slug = _snake(_PATH_PLACEHOLDER_RE.sub("", path)) or "root"
     return f"{method}_{slug}"
 
 
@@ -164,7 +177,7 @@ def _group(path: str, operation: Any) -> str:
     if tags:
         return _snake(tags[0])
     for segment in path.strip("/").split("/"):
-        if segment and not segment.startswith("{") and not re.fullmatch(r"v\d+", segment):
+        if segment and not segment.startswith("{") and _VERSION_SEGMENT_RE.fullmatch(segment) is None:
             return _snake(segment)
     return "root"
 
@@ -225,13 +238,19 @@ def parse_endpoints(spec: Any) -> list[Endpoint]:
                 continue
             path_params: list[Param] = []
             query_params: list[Param] = []
+            seen_path: set[str] = set()
+            seen_query: set[str] = set()
             for raw in [*shared_params, *(operation.parameters or [])]:
                 parsed = _parse_param(resolver, raw)
                 if parsed is None:
                     continue
                 location, param = parsed
-                bucket = path_params if location == "path" else query_params
-                if all(existing.name != param.name for existing in bucket):
+                if location == "path":
+                    bucket, seen = path_params, seen_path
+                else:
+                    bucket, seen = query_params, seen_query
+                if param.name not in seen:
+                    seen.add(param.name)
                     bucket.append(param)
             endpoints.append(
                 Endpoint(

@@ -71,13 +71,37 @@ def _check_secrets(source: str) -> list[Issue]:
     return issues
 
 
-def _uses_shared_client(tree: ast.Module) -> bool:
+def _imports_req_cli(node: ast.AST) -> bool:
+    """Return True when *node* imports anything from the ``req_cli`` package."""
+    if isinstance(node, ast.ImportFrom):
+        return node.module is not None and node.module.startswith("req_cli")
+    return isinstance(node, ast.Import) and any(a.name.startswith("req_cli") for a in node.names)
+
+
+def _check_style(tree: ast.Module) -> list[Issue]:
+    """Flag ``eval`` dispatch and modules bypassing the shared client in one walk."""
+    uses_shared_client = False
+    issues = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("req_cli"):
-            return True
-        if isinstance(node, ast.Import) and any(a.name.startswith("req_cli") for a in node.names):
-            return True
-    return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "eval":
+            issues.append(
+                Issue(
+                    level="error",
+                    message="uses eval() dispatch - req-cli imports and calls functions directly",
+                    lineno=node.lineno,
+                ),
+            )
+        elif not uses_shared_client and _imports_req_cli(node):
+            uses_shared_client = True
+    if not uses_shared_client:
+        issues.append(
+            Issue(
+                level="warning",
+                message="module does not import req_cli - request functions should use "
+                "req_cli.core.client.send for profiles/proxies to apply",
+            ),
+        )
+    return issues
 
 
 def _check_functions(tree: ast.Module) -> list[Issue]:
@@ -129,27 +153,6 @@ def _args_with_defaults(
     pairs = list(zip(positional, padded + list(args.defaults), strict=True))
     pairs += list(zip(args.kwonlyargs, args.kw_defaults, strict=True))
     return pairs
-
-
-def _check_style(tree: ast.Module) -> list[Issue]:
-    issues = [
-        Issue(
-            level="error",
-            message="uses eval() dispatch - req-cli imports and calls functions directly",
-            lineno=node.lineno,
-        )
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "eval"
-    ]
-    if not _uses_shared_client(tree):
-        issues.append(
-            Issue(
-                level="warning",
-                message="module does not import req_cli - request functions should use "
-                "req_cli.core.client.send for profiles/proxies to apply",
-            ),
-        )
-    return issues
 
 
 def validate_source(source: str, path: Path) -> ValidationReport:

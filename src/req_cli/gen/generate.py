@@ -21,9 +21,13 @@ from req_cli.gen.openapi import Endpoint, Param
 
 INDENT = "    "
 
+_SAFE_NAME_RE = re.compile(r"[^0-9a-zA-Z_]")
+_DEFAULT_BY_TYPE: dict[str, Any] = {"string": "", "integer": 0, "number": 0.0, "boolean": False}
+"""Fallback defaults per schema type when a parameter declares no example."""
+
 
 def _safe_name(name: str) -> str:
-    safe = re.sub(r"[^0-9a-zA-Z_]", "_", name)
+    safe = _SAFE_NAME_RE.sub("_", name)
     if not safe or safe[0].isdigit():
         safe = f"p_{safe}"
     if keyword.iskeyword(safe):
@@ -34,7 +38,7 @@ def _safe_name(name: str) -> str:
 def _default_for(param: Param) -> Any:
     if param.example is not None:
         return param.example
-    return {"string": "", "integer": 0, "number": 0.0, "boolean": False}.get(param.schema_type, "")
+    return _DEFAULT_BY_TYPE.get(param.schema_type, "")
 
 
 def _literal(value: Any, indent_level: int) -> str:

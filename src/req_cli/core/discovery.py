@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -24,6 +25,12 @@ from req_cli.core.client import Result
 from req_cli.core.config import CONFIG_FUNCTIONS_FILE_NAME, global_store_dir, project_requests_dir
 
 Scope = Literal["local", "global"]
+
+_SCAN_CACHE_MAX_ENTRIES = 1024
+"""Upper bound for memoized per-file parses; hit only by pathological path churn."""
+
+_scan_cache: dict[str, tuple[int, int, tuple[RequestFunction, ...]]] = {}
+"""Parsed functions by module path: ``(mtime_ns, size, functions)``."""
 
 
 class DiscoveryError(Exception):
@@ -65,25 +72,84 @@ def _functions_from_source(source: str) -> tuple[RequestFunction, ...]:
     )
 
 
+def _cached_functions(path: Path) -> tuple[RequestFunction, ...] | None:
+    """Return memoized functions for *path*, or None when it must be reparsed."""
+    try:
+        info = path.stat()
+    except OSError:
+        _scan_cache.pop(str(path), None)
+        return None
+    cached = _scan_cache.get(str(path))
+    if cached is not None and (cached[0], cached[1]) == (info.st_mtime_ns, info.st_size):
+        return cached[2]
+    return None
+
+
+def _remember_functions(path: Path, functions: tuple[RequestFunction, ...]) -> None:
+    """Memoize *functions* for *path* under its current stat snapshot."""
+    try:
+        info = path.stat()
+    except OSError:
+        return
+    key = str(path)
+    _scan_cache[key] = (info.st_mtime_ns, info.st_size, functions)
+    if len(_scan_cache) > _SCAN_CACHE_MAX_ENTRIES:
+        _scan_cache.clear()
+        _scan_cache[key] = (info.st_mtime_ns, info.st_size, functions)
+
+
+def _scan_one_level(dir_path: str) -> tuple[list[Path], list[str]]:
+    """Return ``(py_files, subdirs)`` for one directory, hidden/private entries skipped."""
+    files: list[Path] = []
+    subdirs: list[str] = []
+    try:
+        with os.scandir(dir_path) as handle:
+            entries = list(handle)
+    except OSError:
+        return ([], [])
+    for entry in entries:
+        name = entry.name
+        if name.startswith(("_", ".")) or name == CONFIG_FUNCTIONS_FILE_NAME:
+            continue
+        try:
+            if entry.is_dir():
+                subdirs.append(entry.path)
+            elif name.endswith(".py") and entry.is_file():
+                files.append(Path(entry.path))
+        except OSError:
+            continue
+    return (files, subdirs)
+
+
+def _candidate_files(directory: Path) -> list[Path]:
+    """List ``*.py`` files (top level plus one subdir level), skipping hidden/private ones."""
+    candidates, subdirs = _scan_one_level(str(directory))
+    for subdir in subdirs:
+        sub_files, _ = _scan_one_level(subdir)
+        candidates.extend(sub_files)
+    candidates.sort()
+    return candidates
+
+
 def _scan_dir(directory: Path, scope: Scope) -> list[RequestModule]:
     if not directory.is_dir():
         return []
-    paths = sorted(set(directory.glob("*.py")) | set(directory.glob("*/*.py")))
     modules = []
-    for path in paths:
-        relative = path.relative_to(directory)
-        if path.name == CONFIG_FUNCTIONS_FILE_NAME or any(part.startswith(("_", ".")) for part in relative.parts):
-            continue
-        try:
-            source = path.read_text()
-        except OSError:
-            continue
+    for path in _candidate_files(directory):
+        functions = _cached_functions(path)
+        if functions is None:
+            try:
+                source = path.read_text()
+            except OSError:
+                continue
+            functions = _functions_from_source(source)
+            _remember_functions(path, functions)
         modules.append(
             RequestModule(
                 path=path,
-                name=str(relative.with_suffix("")),
+                name=str(path.relative_to(directory).with_suffix("")),
                 scope=scope,
-                functions=_functions_from_source(source),
+                functions=functions,
             ),
         )
     return modules

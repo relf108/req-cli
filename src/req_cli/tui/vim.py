@@ -169,15 +169,13 @@ class VimTree(_GgMixin, _SearchMixin, Tree[object]):
 
     def _find_matches(self, needle: str) -> list[typing.Any]:
         found: list[TreeNode[object]] = []
-
-        def walk(node: TreeNode[object]) -> None:
-            for child in node.children:
-                if needle in str(child.label).lower():
-                    found.append(child)
-                walk(child)
-
-        walk(self.root)
-        return list(found)
+        stack = list(reversed(self.root.children))
+        while stack:
+            node = stack.pop()
+            if needle in str(node.label).lower():
+                found.append(node)
+            stack.extend(reversed(node.children))
+        return found
 
     def _go_to_match(self, match: typing.Any) -> None:
         node: TreeNode[object] = match
@@ -356,8 +354,11 @@ class VimLog(_GgMixin, _SearchMixin, RichLog):
 
     def render_line(self, y: int) -> Strip:
         """Overlay search and visual-selection styles on a visible line."""
-        strip = super().render_line(y)
         needle = self._search_needle
+        bounds = self._visual_bounds
+        if not needle and bounds is None:
+            return super().render_line(y)
+        strip = super().render_line(y)
         text = strip.text
         lower = text.lower()
         if needle and needle in lower:
@@ -384,7 +385,6 @@ class VimLog(_GgMixin, _SearchMixin, RichLog):
                 pieces.append(strip.crop(position, strip.cell_length))
             strip = Strip.join(pieces)
 
-        bounds = self._visual_bounds
         line = int(self.scroll_offset.y) + y
         if bounds is not None and bounds[0] <= line <= bounds[1]:
             style = self.get_component_rich_style("vimlog--visual-selection")
