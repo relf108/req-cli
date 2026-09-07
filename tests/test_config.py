@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock, Thread
 
 import pytest
 
+from req_cli.core import config as config_module
 from req_cli.core.config import (
     ConfigError,
     Profile,
@@ -102,6 +106,248 @@ def test_global_header_uses_global_config_function(isolated_dirs: dict[str, Path
     assert load_config().profile("live").headers["Authorization"] == "Bearer global-token"
 
 
+def test_dynamic_headers_are_not_evaluated_until_profile_is_selected(
+    isolated_dirs: dict[str, Path],
+) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.local]\nbase_url = "http://localhost"\n'
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+
+    config = load_config()
+
+    assert config.profile("local").headers == {}
+    with pytest.raises(ConfigError, match=r"requests/config_functions\.py: required"):
+        config.profile("live")
+
+
+def test_resolved_dynamic_headers_are_cached(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text(
+        "calls = 0\n"
+        "def get_token():\n"
+        "    global calls\n"
+        "    calls += 1\n"
+        "    if calls > 1:\n"
+        "        raise RuntimeError('called twice')\n"
+        "    return 'secret'\n",
+    )
+
+    config = load_config()
+
+    assert config.profile("live").headers["Authorization"] == "Bearer secret"
+    assert config.profile("live").headers["Authorization"] == "Bearer secret"
+
+
+def test_concurrent_dynamic_header_resolution_runs_function_once(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text(
+        "import time\n"
+        "calls = 0\n"
+        "def get_token():\n"
+        "    global calls\n"
+        "    calls += 1\n"
+        "    time.sleep(0.05)\n"
+        "    if calls > 1:\n"
+        "        raise RuntimeError('called twice')\n"
+        "    return 'secret'\n",
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        profiles = list(executor.map(lambda _: load_config().profile("live"), range(2)))
+
+    assert [profile.headers["Authorization"] for profile in profiles] == [
+        "Bearer secret",
+        "Bearer secret",
+    ]
+
+
+def test_concurrent_cold_loads_share_config(isolated_dirs: dict[str, Path], monkeypatch) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text('[profiles.local]\nbase_url = "http://localhost"\n')
+    original_load_toml = config_module.__dict__["_load_toml"]
+    call_lock = Lock()
+    calls = 0
+
+    def slow_load_toml(path):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+        time.sleep(0.05)
+        return original_load_toml(path)
+
+    monkeypatch.setattr(config_module, "_load_toml", slow_load_toml)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        configs = list(executor.map(lambda _: load_config(), range(2)))
+
+    assert configs[0] is configs[1]
+    assert calls == 2
+
+
+def test_dynamic_header_can_select_another_profile(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.first]\nbase_url = "https://first.example.test"\n'
+        '[profiles.first.headers]\nX-First = "{first}"\n'
+        '[profiles.second]\nbase_url = "https://second.example.test"\n'
+        '[profiles.second.headers]\nX-Second = "{second}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text(
+        "from req_cli.core.config import load_config\n"
+        "def first():\n"
+        '    return load_config().profile("second").headers["X-Second"]\n'
+        "def second():\n"
+        "    return 'nested'\n",
+    )
+    result = []
+    errors = []
+
+    def resolve() -> None:
+        try:
+            result.append(load_config().profile("first").headers["X-First"])
+        except Exception as exc:  # noqa: BLE001 - assertion reports helper failures
+            errors.append(exc)
+
+    thread = Thread(target=resolve, daemon=True)
+    thread.start()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive(), "dynamic profile resolution deadlocked"
+    assert errors == []
+    assert result == ["nested"]
+
+
+def test_cross_thread_dynamic_profile_cycle_fails_without_deadlock(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.first]\nbase_url = "https://first.example.test"\n'
+        '[profiles.first.headers]\nX-First = "{first}"\n'
+        '[profiles.second]\nbase_url = "https://second.example.test"\n'
+        '[profiles.second.headers]\nX-Second = "{second}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text(
+        "from threading import Barrier\n"
+        "from req_cli.core.config import load_config\n"
+        "barrier = Barrier(2)\n"
+        "def first():\n"
+        "    barrier.wait()\n"
+        '    return load_config().profile("second").headers["X-Second"]\n'
+        "def second():\n"
+        "    barrier.wait()\n"
+        '    return load_config().profile("first").headers["X-First"]\n',
+    )
+    errors = []
+
+    def resolve(name: str) -> None:
+        try:
+            load_config().profile(name)
+        except Exception as exc:  # noqa: BLE001 - assertion reports helper failures
+            errors.append(exc)
+
+    threads = [
+        Thread(target=resolve, args=("first",), daemon=True),
+        Thread(target=resolve, args=("second",), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert not any(thread.is_alive() for thread in threads), "cyclic profile resolution deadlocked"
+    assert len(errors) == 2
+    assert all(isinstance(error, ConfigError) for error in errors)
+    assert all("cyclic configuration resolution" in str(error) for error in errors)
+
+
+def test_config_function_module_load_does_not_hold_cache_lock(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text(
+        "from threading import Thread\n"
+        "from req_cli.core.config import load_config\n"
+        "thread = Thread(target=load_config)\n"
+        "thread.start()\n"
+        "thread.join(timeout=1)\n"
+        "if thread.is_alive():\n"
+        "    raise RuntimeError('cache lock held during module load')\n"
+        "def get_token():\n"
+        "    return 'secret'\n",
+    )
+
+    assert load_config().profile("live").headers["Authorization"] == "Bearer secret"
+
+
+def test_concurrent_profiles_load_config_function_module_once(isolated_dirs: dict[str, Path]) -> None:
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.first]\nbase_url = "https://first.example.test"\n'
+        '[profiles.first.headers]\nX-First = "{first}"\n'
+        '[profiles.second]\nbase_url = "https://second.example.test"\n'
+        '[profiles.second.headers]\nX-Second = "{second}"\n',
+    )
+    load_log = isolated_dirs["project"] / "module-loads.log"
+    (requests_dir / "config_functions.py").write_text(
+        "import time\n"
+        "from pathlib import Path\n"
+        "time.sleep(0.05)\n"
+        f"with Path({str(load_log)!r}).open('a') as log:\n"
+        "    log.write('loaded\\n')\n"
+        "def first():\n"
+        "    return 'first'\n"
+        "def second():\n"
+        "    return 'second'\n",
+    )
+    config = load_config()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        profiles = list(executor.map(config.profile, ("first", "second")))
+
+    assert [profile.name for profile in profiles] == ["first", "second"]
+    assert load_log.read_text().splitlines() == ["loaded"]
+
+
+def test_relative_project_root_keeps_absolute_config_functions_path(
+    isolated_dirs: dict[str, Path],
+    monkeypatch,
+) -> None:
+    relative_root = Path("nested")
+    requests_dir = relative_root / "requests"
+    requests_dir.mkdir(parents=True)
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text("def get_token():\n    return 'secret'\n")
+
+    config = load_config(relative_root)
+    absolute_config = load_config((isolated_dirs["project"] / relative_root).resolve())
+    monkeypatch.chdir(isolated_dirs["project"].parent)
+
+    assert config is absolute_config
+    assert config.profile("live").headers["Authorization"] == "Bearer secret"
+
+
 def test_header_function_requires_adjacent_config_functions(isolated_dirs: dict[str, Path]) -> None:
     requests_dir = isolated_dirs["project"] / "requests"
     requests_dir.mkdir()
@@ -111,7 +357,7 @@ def test_header_function_requires_adjacent_config_functions(isolated_dirs: dict[
     )
 
     with pytest.raises(ConfigError, match=r"requests/config_functions\.py: required"):
-        load_config()
+        load_config().profile("live")
 
 
 @pytest.mark.parametrize(
@@ -132,7 +378,7 @@ def test_invalid_header_function(isolated_dirs: dict[str, Path], function: str, 
     (requests_dir / "config_functions.py").write_text(function)
 
     with pytest.raises(ConfigError, match=error):
-        load_config()
+        load_config().profile("live")
 
 
 def test_unknown_profile_raises(isolated_dirs: dict[str, Path]) -> None:

@@ -165,10 +165,14 @@ project config functions, while global profiles use global config functions.
 Missing functions, exceptions, and non-string return values are reported as
 configuration errors with profile and header context.
 
-Functions run whenever configuration is loaded, not only when an HTTP request
-is sent. This includes commands such as `req profile list` and TUI startup. A
-helper may be called more than once during a TUI session, so it should be safe
-to repeat and should not depend on module-level mutable state.
+Functions run when their profile is first selected for use, not when
+configuration is loaded or profiles are listed. Resolved headers are cached
+while configuration remains unchanged. Within that first resolution, each
+placeholder invokes its helper, so helpers should remain safe to repeat.
+
+Use `Config.profile()` when consuming a profile. `Config.profiles` retains
+unevaluated header templates so callers can list profiles without running
+their helpers.
 
 Only header values support interpolation. Text matching `{identifier}` is
 treated as a function call; there is currently no escape syntax for a literal

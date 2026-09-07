@@ -14,7 +14,7 @@
 
         req-cli = python.pkgs.buildPythonApplication {
           pname = "req-cli";
-          version = "0.2.0";
+          version = "0.4.0";
           pyproject = true;
           src = ./.;
 

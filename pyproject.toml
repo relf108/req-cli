@@ -1,6 +1,6 @@
 [project]
 name = "req-cli"
-version = "0.3.0"
+version = "0.4.0"
 description = "Generate and send saved API requests from OpenAPI specs via a lazygit-style TUI"
 readme = "README.md"
 requires-python = ">=3.13"

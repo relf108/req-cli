@@ -33,9 +33,12 @@ import importlib.util
 import os
 import re
 import tomllib
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from threading import Condition, RLock, get_ident
 from types import ModuleType
+from typing import cast
 
 REQUESTS_DIR_NAME = "requests"
 CONFIG_FILE_NAME = "config.toml"
@@ -48,6 +51,20 @@ _CACHE_MAX_ENTRIES = 1024
 _FileStat = tuple[int, int, bool]
 """``(mtime_ns, size, exists)`` snapshot used to validate a cached entry."""
 
+
+_NO_RESULT = object()
+
+
+@dataclass
+class _InFlight:
+    """One process-wide in-flight configuration operation."""
+
+    owner_thread_id: int
+    done: bool = False
+    result: object = _NO_RESULT
+    error: BaseException | None = None
+
+
 _toml_cache: dict[str, tuple[_FileStat, dict[str, object]]] = {}
 """Parsed TOML by config path; entries are read-only and valid while the stat matches."""
 
@@ -56,6 +73,13 @@ _functions_cache: dict[str, tuple[_FileStat, ModuleType]] = {}
 
 _config_cache: dict[tuple[str, _FileStat, str, _FileStat, _FileStat, _FileStat], Config] = {}
 """Merged configs keyed by both TOML stats plus both adjacent functions-file stats."""
+
+_cache_lock = RLock()
+"""Serialize cache population so concurrent cold loads share one config."""
+
+_work_condition = Condition()
+_in_flight: dict[tuple[object, ...], _InFlight] = {}
+_thread_waits_for: dict[int, tuple[object, ...]] = {}
 
 
 def _stat_of(path: Path) -> _FileStat:
@@ -67,14 +91,79 @@ def _stat_of(path: Path) -> _FileStat:
     return (info.st_mtime_ns, info.st_size, True)
 
 
+def _wait_would_cycle(waiter_thread_id: int, owner_thread_id: int) -> bool:
+    """Return whether waiting for *owner_thread_id* closes a config dependency cycle."""
+    visited: set[int] = set()
+    current_thread_id = owner_thread_id
+    while current_thread_id not in visited:
+        if current_thread_id == waiter_thread_id:
+            return True
+        visited.add(current_thread_id)
+        waiting_key = _thread_waits_for.get(current_thread_id)
+        if waiting_key is None:
+            return False
+        work = _in_flight.get(waiting_key)
+        if work is None:
+            return False
+        current_thread_id = work.owner_thread_id
+    return True
+
+
+def _run_singleflight[T](key: tuple[object, ...], operation: Callable[[], T]) -> T:
+    """Run one configuration operation per key and share its result with waiters."""
+    thread_id = get_ident()
+    with _work_condition:
+        work = _in_flight.get(key)
+        if work is not None:
+            if work.owner_thread_id == thread_id:
+                msg = f"recursive configuration resolution for {key!r}"
+                raise ConfigError(msg)
+            _thread_waits_for[thread_id] = key
+            if _wait_would_cycle(thread_id, work.owner_thread_id):
+                del _thread_waits_for[thread_id]
+                msg = f"cyclic configuration resolution for {key!r}"
+                raise ConfigError(msg)
+            try:
+                while not work.done:
+                    _work_condition.wait()
+            finally:
+                del _thread_waits_for[thread_id]
+            if work.error is not None:
+                raise work.error
+            if work.result is _NO_RESULT:
+                msg = f"configuration resolution produced no result for {key!r}"
+                raise ConfigError(msg)
+            return cast("T", work.result)
+        work = _InFlight(owner_thread_id=thread_id)
+        _in_flight[key] = work
+
+    try:
+        result = operation()
+    except BaseException as exc:
+        with _work_condition:
+            work.error = exc
+            work.done = True
+            del _in_flight[key]
+            _work_condition.notify_all()
+        raise
+
+    with _work_condition:
+        work.result = result
+        work.done = True
+        del _in_flight[key]
+        _work_condition.notify_all()
+    return result
+
+
 def _invalidate_caches_for(path: Path) -> None:
     """Drop cached entries that could reflect the previous content of *path*."""
-    key = str(path)
-    _toml_cache.pop(key, None)
-    _functions_cache.pop(key, None)
-    stale = [cache_key for cache_key in _config_cache if cache_key[0] == key or cache_key[2] == key]
-    for cache_key in stale:
-        del _config_cache[cache_key]
+    with _cache_lock:
+        key = str(path)
+        _toml_cache.pop(key, None)
+        _functions_cache.pop(key, None)
+        stale = [cache_key for cache_key in _config_cache if cache_key[0] == key or cache_key[2] == key]
+        for cache_key in stale:
+            del _config_cache[cache_key]
 
 
 CONFIG_TEMPLATE = """\
@@ -119,6 +208,23 @@ class Profile:
     proxies: dict[str, str] = field(default_factory=dict)
     timeout: float | None = None
     """Seconds before a request times out; ``None`` (the default) waits forever."""
+    _config_functions_path: Path | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def has_dynamic_headers(self) -> bool:
+        """Whether this profile has header functions awaiting evaluation."""
+        return self._config_functions_path is not None
+
+    def resolved(self) -> Profile:
+        """Return this profile with dynamic header values evaluated."""
+        if self._config_functions_path is None:
+            return self
+        module = _load_config_functions(self._config_functions_path)
+        headers = {
+            header: _interpolate_header(value, module, self._config_functions_path, self.name, header)
+            for header, value in self.headers.items()
+        }
+        return replace(self, headers=headers, _config_functions_path=None)
 
 
 @dataclass(frozen=True)
@@ -127,16 +233,37 @@ class Config:
 
     profiles: dict[str, Profile]
     default_profile: str = "local"
+    _resolved_profiles: dict[str, Profile] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _resolved_lock: RLock = field(default_factory=RLock, init=False, repr=False, compare=False)
 
     def profile(self, name: str | None = None) -> Profile:
         """Return the named profile, or the default profile when *name* is None."""
         key = name or self.default_profile
         try:
-            return self.profiles[key]
+            profile = self.profiles[key]
         except KeyError:
             available = ", ".join(sorted(self.profiles)) or "<none>"
             msg = f"unknown profile {key!r} (available: {available})"
             raise ConfigError(msg) from None
+
+        if not profile.has_dynamic_headers:
+            return profile
+        return self._resolve_dynamic_profile(key, profile)
+
+    def _resolve_dynamic_profile(self, key: str, profile: Profile) -> Profile:
+        """Resolve one dynamic profile, sharing in-flight work across threads."""
+        with self._resolved_lock:
+            resolved = self._resolved_profiles.get(key)
+        if resolved is not None:
+            return resolved
+
+        def resolve_and_cache() -> Profile:
+            resolved = profile.resolved()
+            with self._resolved_lock:
+                self._resolved_profiles[key] = resolved
+            return resolved
+
+        return _run_singleflight(("profile", id(self), key), resolve_and_cache)
 
 
 def global_config_dir() -> Path:
@@ -157,13 +284,8 @@ def project_requests_dir(project_root: Path | None = None) -> Path:
     return root / REQUESTS_DIR_NAME
 
 
-def _load_config_functions(path: Path) -> ModuleType:
-    """Load trusted Python helpers used by the adjacent TOML config."""
-    key = str(path)
-    stat = _stat_of(path)
-    cached = _functions_cache.get(key)
-    if cached is not None and cached[0] == stat:
-        return cached[1]
+def _exec_config_functions(path: Path) -> ModuleType:
+    """Execute and return one trusted config-function module."""
     if not path.is_file():
         msg = f"{path}: required for config function calls"
         raise ConfigError(msg)
@@ -177,11 +299,32 @@ def _load_config_functions(path: Path) -> ModuleType:
     except Exception as exc:
         msg = f"{path}: failed to load config functions: {exc}"
         raise ConfigError(msg) from exc
-    _functions_cache[key] = (stat, module)
-    if len(_functions_cache) > _CACHE_MAX_ENTRIES:
-        _functions_cache.clear()
-        _functions_cache[key] = (stat, module)
     return module
+
+
+def _load_config_functions(path: Path) -> ModuleType:
+    """Load trusted Python helpers used by the adjacent TOML config."""
+    key = str(path)
+    stat = _stat_of(path)
+    with _cache_lock:
+        cached = _functions_cache.get(key)
+        if cached is not None and cached[0] == stat:
+            return cached[1]
+
+    def load_and_cache() -> ModuleType:
+        module = _exec_config_functions(path)
+        with _cache_lock:
+            cached = _functions_cache.get(key)
+            if cached is not None and cached[0] == stat:
+                return cached[1]
+            if _stat_of(path) == stat:
+                _functions_cache[key] = (stat, module)
+                if len(_functions_cache) > _CACHE_MAX_ENTRIES:
+                    _functions_cache.clear()
+                    _functions_cache[key] = (stat, module)
+        return module
+
+    return _run_singleflight(("config-functions", key, stat), load_and_cache)
 
 
 def _interpolate_header(value: str, module: ModuleType, path: Path, profile: str, header: str) -> str:
@@ -211,8 +354,7 @@ def _interpolate_header(value: str, module: ModuleType, path: Path, profile: str
 
 def _parse_profiles(raw: dict[str, object], config_path: Path) -> dict[str, Profile]:
     profiles: dict[str, Profile] = {}
-    config_functions: ModuleType | None = None
-    config_functions_path = config_path.with_name(CONFIG_FUNCTIONS_FILE_NAME)
+    config_functions_path = config_path.with_name(CONFIG_FUNCTIONS_FILE_NAME).resolve()
     raw_profiles = raw.get("profiles", {})
     if not isinstance(raw_profiles, dict):
         msg = "'profiles' must be a table"
@@ -235,43 +377,39 @@ def _parse_profiles(raw: dict[str, object], config_path: Path) -> dict[str, Prof
             msg = f"profile {name!r}: 'timeout' must be a number"
             raise ConfigError(msg)
         parsed_headers = {str(k): str(v) for k, v in headers.items()}
-        if any(_FUNCTION_PATTERN.search(value) for value in parsed_headers.values()):
-            if config_functions is None:
-                config_functions = _load_config_functions(config_functions_path)
-            parsed_headers = {
-                key: _interpolate_header(value, config_functions, config_functions_path, str(name), key)
-                for key, value in parsed_headers.items()
-            }
+        has_dynamic_headers = any(_FUNCTION_PATTERN.search(value) for value in parsed_headers.values())
         profiles[name] = Profile(
             name=name,
             base_url=base_url.rstrip("/"),
             headers=parsed_headers,
             proxies={str(k): str(v) for k, v in proxies.items()},
             timeout=float(timeout) if timeout is not None else None,
+            _config_functions_path=config_functions_path if has_dynamic_headers else None,
         )
     return profiles
 
 
 def _load_toml(path: Path) -> dict[str, object]:
     """Return parsed TOML, reusing the cached copy while the file is unchanged."""
-    key = str(path)
-    stat = _stat_of(path)
-    cached = _toml_cache.get(key)
-    if cached is not None and cached[0] == stat:
-        return cached[1]
-    try:
-        with path.open("rb") as fh:
-            parsed: dict[str, object] = tomllib.load(fh)
-    except FileNotFoundError:
-        parsed = {}
-    except tomllib.TOMLDecodeError as exc:
-        msg = f"{path}: invalid TOML: {exc}"
-        raise ConfigError(msg) from exc
-    _toml_cache[key] = (stat, parsed)
-    if len(_toml_cache) > _CACHE_MAX_ENTRIES:
-        _toml_cache.clear()
+    with _cache_lock:
+        key = str(path)
+        stat = _stat_of(path)
+        cached = _toml_cache.get(key)
+        if cached is not None and cached[0] == stat:
+            return cached[1]
+        try:
+            with path.open("rb") as fh:
+                parsed: dict[str, object] = tomllib.load(fh)
+        except FileNotFoundError:
+            parsed = {}
+        except tomllib.TOMLDecodeError as exc:
+            msg = f"{path}: invalid TOML: {exc}"
+            raise ConfigError(msg) from exc
         _toml_cache[key] = (stat, parsed)
-    return parsed
+        if len(_toml_cache) > _CACHE_MAX_ENTRIES:
+            _toml_cache.clear()
+            _toml_cache[key] = (stat, parsed)
+        return parsed
 
 
 def config_path(scope: str = "local", project_root: Path | None = None) -> Path:
@@ -283,12 +421,13 @@ def config_path(scope: str = "local", project_root: Path | None = None) -> Path:
 
 def ensure_config_file(scope: str = "local", project_root: Path | None = None) -> Path:
     """Return the config path for *scope*, seeding it with a template if missing."""
-    path = config_path(scope, project_root)
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(CONFIG_TEMPLATE)
-        _invalidate_caches_for(path)
-    return path
+    with _cache_lock:
+        path = config_path(scope, project_root)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(CONFIG_TEMPLATE)
+            _invalidate_caches_for(path)
+        return path
 
 
 def save_profile(
@@ -299,6 +438,18 @@ def save_profile(
     make_default: bool = False,
 ) -> Path:
     """Add or replace *profile* in the scope's config.toml, preserving other entries."""
+    with _cache_lock:
+        return _save_profile(profile, scope, project_root, make_default=make_default)
+
+
+def _save_profile(
+    profile: Profile,
+    scope: str,
+    project_root: Path | None,
+    *,
+    make_default: bool,
+) -> Path:
+    """Write a profile while the process-wide cache lock is held."""
     import tomli_w  # noqa: PLC0415 - only needed on the write path
 
     path = config_path(scope, project_root)
@@ -331,12 +482,18 @@ def load_config(project_root: Path | None = None) -> Config:
     exists anywhere, a bare ``local`` profile pointing at 127.0.0.1:8000 is
     provided so the tool works out of the box.
 
-    Results are memoized while none of the underlying files change, so the
-    per-request :func:`req_cli.core.client.send` path pays only a few stat
-    calls instead of reparsing TOML and re-executing config functions.
+    Results are memoized while none of the underlying files change. Dynamic
+    headers are evaluated only when their profile is selected, then cached on
+    the loaded config.
     """
-    global_path = global_config_dir() / CONFIG_FILE_NAME
-    project_path = project_requests_dir(project_root) / CONFIG_FILE_NAME
+    with _cache_lock:
+        return _load_config(project_root)
+
+
+def _load_config(project_root: Path | None) -> Config:
+    """Load config while the process-wide cache lock is held."""
+    global_path = (global_config_dir() / CONFIG_FILE_NAME).resolve()
+    project_path = (project_requests_dir(project_root) / CONFIG_FILE_NAME).resolve()
     cache_key = (
         str(global_path),
         _stat_of(global_path),
