@@ -45,6 +45,7 @@ class RunScreen(Screen[None]):
         Binding("/", "open_search", "Search"),
         Binding("r", "refresh", "Refresh"),
         Binding("p", "cycle_profile", "Profile"),
+        Binding("P", "back_cycle_profile", "Profile"),
         Binding("n", "generate", "Generate"),
         Binding("c", "edit_config('local')", "Config"),
         Binding("C", "edit_config('global')", "Global config", show=False),
@@ -226,6 +227,21 @@ class RunScreen(Screen[None]):
         previous = self._profile
         index = self._profile_names.index(self._profile)
         self._profile = self._profile_names[(index + 1) % len(self._profile_names)]
+        set_profile_override(self._profile)
+        self.sub_title = f"profile: {self._profile}"
+        self._set_status(f"profile: {previous} -> {self._profile}")
+
+    def action_back_cycle_profile(self) -> None:
+        """Switch to the previous configured profile."""
+        if len(self._profile_names) <= 1:
+            self._set_status(
+                f"only one profile configured ({self._profile}) - add [profiles.<name>] "
+                "entries to requests/config.toml or ~/.config/req-cli/config.toml",
+            )
+            return
+        previous = self._profile
+        index = self._profile_names.index(self._profile)
+        self._profile = self._profile_names[(index - 1) % len(self._profile_names)]
         set_profile_override(self._profile)
         self.sub_title = f"profile: {self._profile}"
         self._set_status(f"profile: {previous} -> {self._profile}")

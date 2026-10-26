@@ -106,6 +106,126 @@ def test_global_header_uses_global_config_function(isolated_dirs: dict[str, Path
     assert load_config().profile("live").headers["Authorization"] == "Bearer global-token"
 
 
+@pytest.mark.parametrize("profile_scope", ["local", "global"])
+@pytest.mark.parametrize(
+    ("local_source", "expected"),
+    [
+        (None, "global-token"),
+        ("def unrelated():\n    return 'unused'\n", "global-token"),
+        ("def get_token():\n    return 'local-token'\n", "local-token"),
+    ],
+)
+def test_config_function_lookup_prefers_local_then_global(
+    isolated_dirs: dict[str, Path],
+    profile_scope: str,
+    local_source: str | None,
+    expected: str,
+) -> None:
+    global_dir = global_config_dir()
+    global_dir.mkdir(parents=True)
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    profile_dir = requests_dir if profile_scope == "local" else global_dir
+    (profile_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    (global_dir / "config_functions.py").write_text("def get_token():\n    return 'global-token'\n")
+    if local_source is not None:
+        (requests_dir / "config_functions.py").write_text(local_source)
+
+    assert load_config().profile("live").headers["Authorization"] == f"Bearer {expected}"
+
+
+def test_header_can_mix_local_and_global_functions(isolated_dirs: dict[str, Path]) -> None:
+    global_dir = global_config_dir()
+    global_dir.mkdir(parents=True)
+    (global_dir / "config_functions.py").write_text("def get_token():\n    return 'global-token'\n")
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "{prefix} {get_token}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text("def prefix():\n    return 'Bearer'\n")
+
+    assert load_config().profile("live").headers["Authorization"] == "Bearer global-token"
+
+
+@pytest.mark.parametrize(
+    ("local_source", "error"),
+    [
+        ("get_token = None\n", "not a callable config function"),
+        ("def get_token():\n    return 42\n", "returned int, not str"),
+        ("def get_token():\n    raise RuntimeError('expired')\n", "failed: expired"),
+    ],
+)
+def test_invalid_local_function_does_not_fall_back_to_global(
+    isolated_dirs: dict[str, Path],
+    local_source: str,
+    error: str,
+) -> None:
+    global_dir = global_config_dir()
+    global_dir.mkdir(parents=True)
+    (global_dir / "config_functions.py").write_text("def get_token():\n    return 'global-token'\n")
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text(local_source)
+
+    with pytest.raises(ConfigError, match=error):
+        load_config().profile("live")
+
+
+def test_unused_global_functions_are_not_loaded(isolated_dirs: dict[str, Path]) -> None:
+    global_dir = global_config_dir()
+    global_dir.mkdir(parents=True)
+    (global_dir / "config_functions.py").write_text("raise RuntimeError('must not load')\n")
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    (requests_dir / "config_functions.py").write_text("def get_token():\n    return 'local-token'\n")
+
+    assert load_config().profile("live").headers["Authorization"] == "Bearer local-token"
+
+
+def test_function_lookup_cache_tracks_both_scopes(isolated_dirs: dict[str, Path]) -> None:
+    global_dir = global_config_dir()
+    global_dir.mkdir(parents=True)
+    global_functions = global_dir / "config_functions.py"
+    global_functions.write_text("def get_token():\n    return 'global-token'\n")
+    requests_dir = isolated_dirs["project"] / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "config.toml").write_text(
+        '[profiles.live]\nbase_url = "https://example.test"\n'
+        '[profiles.live.headers]\nAuthorization = "Bearer {get_token}"\n',
+    )
+    original = load_config()
+    assert original.profile("live").headers["Authorization"] == "Bearer global-token"
+
+    global_functions.write_text("def get_token():\n    return 'updated-global-token'\n")
+    updated = load_config()
+    assert updated is not original
+    assert updated.profile("live").headers["Authorization"] == "Bearer updated-global-token"
+
+    local_functions = requests_dir / "config_functions.py"
+    local_functions.write_text("def get_token():\n    return 'local-token'\n")
+    overridden = load_config()
+    assert overridden is not updated
+    assert overridden.profile("live").headers["Authorization"] == "Bearer local-token"
+
+    local_functions.unlink()
+    restored = load_config()
+    assert restored is not overridden
+    assert restored.profile("live").headers["Authorization"] == "Bearer updated-global-token"
+
+
 def test_dynamic_headers_are_not_evaluated_until_profile_is_selected(
     isolated_dirs: dict[str, Path],
 ) -> None:

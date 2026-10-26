@@ -179,7 +179,7 @@ base_url = "http://127.0.0.1:8000"
 
 # [profiles.local.headers]
 # X-Example-Header = "value"
-# Authorization = "Bearer {get_token}"  # calls get_token() from requests/config_functions.py
+# Authorization = "Bearer {get_token}"  # looks in local, then global config_functions.py
 
 # [profiles.live]
 # base_url = "https://api.example.test"
@@ -208,23 +208,22 @@ class Profile:
     proxies: dict[str, str] = field(default_factory=dict)
     timeout: float | None = None
     """Seconds before a request times out; ``None`` (the default) waits forever."""
-    _config_functions_path: Path | None = field(default=None, repr=False, compare=False)
+    _config_functions_paths: tuple[Path, ...] = field(default=(), repr=False, compare=False)
 
     @property
     def has_dynamic_headers(self) -> bool:
         """Whether this profile has header functions awaiting evaluation."""
-        return self._config_functions_path is not None
+        return bool(self._config_functions_paths)
 
     def resolved(self) -> Profile:
         """Return this profile with dynamic header values evaluated."""
-        if self._config_functions_path is None:
+        if not self._config_functions_paths:
             return self
-        module = _load_config_functions(self._config_functions_path)
         headers = {
-            header: _interpolate_header(value, module, self._config_functions_path, self.name, header)
+            header: _interpolate_header(value, self._config_functions_paths, self.name, header)
             for header, value in self.headers.items()
         }
-        return replace(self, headers=headers, _config_functions_path=None)
+        return replace(self, headers=headers, _config_functions_paths=())
 
 
 @dataclass(frozen=True)
@@ -327,12 +326,29 @@ def _load_config_functions(path: Path) -> ModuleType:
     return _run_singleflight(("config-functions", key, stat), load_and_cache)
 
 
-def _interpolate_header(value: str, module: ModuleType, path: Path, profile: str, header: str) -> str:
+def _find_config_function(name: str, paths: tuple[Path, ...]) -> tuple[object, Path]:
+    """Find a helper by name, preferring local definitions over global ones."""
+    last_path: Path | None = None
+    for path in paths:
+        if not path.is_file():
+            continue
+        module = _load_config_functions(path)
+        last_path = path
+        function = getattr(module, name, _NO_RESULT)
+        if function is not _NO_RESULT:
+            return function, path
+    if last_path is None:
+        msg = f"{paths[0]}: required for config function calls (searched: {', '.join(map(str, paths))})"
+        raise ConfigError(msg)
+    return None, last_path
+
+
+def _interpolate_header(value: str, paths: tuple[Path, ...], profile: str, header: str) -> str:
     """Replace function placeholders in one header value."""
 
     def replace(match: re.Match[str]) -> str:
         name = match.group(1)
-        function = getattr(module, name, None)
+        function, path = _find_config_function(name, paths)
         if not callable(function):
             msg = f"{path}: profile {profile!r} header {header!r}: {name!r} is not a callable config function"
             raise ConfigError(msg)
@@ -352,9 +368,8 @@ def _interpolate_header(value: str, module: ModuleType, path: Path, profile: str
     return _FUNCTION_PATTERN.sub(replace, value)
 
 
-def _parse_profiles(raw: dict[str, object], config_path: Path) -> dict[str, Profile]:
+def _parse_profiles(raw: dict[str, object], config_functions_paths: tuple[Path, ...]) -> dict[str, Profile]:
     profiles: dict[str, Profile] = {}
-    config_functions_path = config_path.with_name(CONFIG_FUNCTIONS_FILE_NAME).resolve()
     raw_profiles = raw.get("profiles", {})
     if not isinstance(raw_profiles, dict):
         msg = "'profiles' must be a table"
@@ -384,7 +399,7 @@ def _parse_profiles(raw: dict[str, object], config_path: Path) -> dict[str, Prof
             headers=parsed_headers,
             proxies={str(k): str(v) for k, v in proxies.items()},
             timeout=float(timeout) if timeout is not None else None,
-            _config_functions_path=config_functions_path if has_dynamic_headers else None,
+            _config_functions_paths=config_functions_paths if has_dynamic_headers else (),
         )
     return profiles
 
@@ -509,8 +524,11 @@ def _load_config(project_root: Path | None) -> Config:
     global_raw = _load_toml(global_path)
     project_raw = _load_toml(project_path)
 
-    profiles = _parse_profiles(global_raw, global_path)
-    profiles.update(_parse_profiles(project_raw, project_path))
+    config_functions_paths = tuple(
+        dict.fromkeys(path.with_name(CONFIG_FUNCTIONS_FILE_NAME) for path in (project_path, global_path)),
+    )
+    profiles = _parse_profiles(global_raw, config_functions_paths)
+    profiles.update(_parse_profiles(project_raw, config_functions_paths))
     if not profiles:
         profiles["local"] = Profile(name="local", base_url="http://127.0.0.1:8000")
 

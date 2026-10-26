@@ -92,7 +92,7 @@ req profile add staging \
 
 Project configuration is read from `./requests/config.toml` and overrides
 global configuration from `~/.config/req-cli/config.toml`. Header profiles can
-use a zero-argument function from the adjacent `config_functions.py`:
+use a zero-argument function from either local or global `config_functions.py`:
 
 ```toml
 [profiles.staging]
@@ -111,8 +111,14 @@ def get_access_token() -> str:
     return os.environ["API_TOKEN"]
 ```
 
+Helpers resolve by name from `./requests/config_functions.py` first, then
+`~/.config/req-cli/config_functions.py`. Local definitions win name clashes,
+including for globally defined profiles. A local profile can use global helpers
+without a local helper file. Invalid local definitions raise an error rather
+than falling back to the global definition.
+
 `config_functions.py` is executable trusted code and is hidden from request
-module discovery.
+module discovery. Helper modules load only when needed by a selected profile.
 
 ## Storage
 
